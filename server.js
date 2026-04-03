@@ -302,6 +302,22 @@ makeRoutes('vendas',          ['admin','vendedor'],             ['admin','vended
 makeRoutes('vendas_sem',      ['admin','vendedor'],             ['admin','vendedor','financeiro']);
 makeRoutes('caixa',           ['admin','financeiro'],           ['admin','financeiro']);
 makeRoutes('investidores',    ['admin'],                        ['admin','investidor','financeiro']);
+
+// Investidores com suas cotas do estoque
+app.get('/api/investidores-completo', auth, async function(req, res) {
+  try {
+    const inv = await pool.query('SELECT * FROM investidores ORDER BY nome');
+    const est = await pool.query('SELECT * FROM estoque ORDER BY investidor');
+    const result = inv.rows.map(function(i) {
+      return Object.assign({}, i, {
+        cotas_estoque: est.rows.filter(function(e) {
+          return e.investidor && e.investidor.toUpperCase() === i.nome.toUpperCase();
+        })
+      });
+    });
+    res.json(result);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
 makeRoutes('agenda',          ['admin','vendedor','financeiro'],['admin','vendedor','financeiro']);
 makeRoutes('contratos',       ['admin','vendedor'],             ['admin','vendedor','financeiro']);
 makeRoutes('parceiros',       ['admin','vendedor'],             ['admin','vendedor','financeiro']);
@@ -402,6 +418,57 @@ app.get('/api/relatorio/estoque-resumo', auth, async function(req, res) {
       FROM estoque GROUP BY categoria, situacao ORDER BY categoria, situacao
     `);
     res.json(r.rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Estoque contempladas disponiveis
+app.get('/api/estoque-contempladas', auth, async function(req, res) {
+  try {
+    const r = await pool.query("SELECT * FROM estoque WHERE situacao='CONTEMPLADA' ORDER BY id DESC");
+    res.json(r.rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Auto-gerar eventos de vencimento para agenda
+app.post('/api/agenda/sync-vencimentos', auth, async function(req, res) {
+  try {
+    // Busca cotas do estoque com vcto preenchido
+    const cotas = await pool.query("SELECT * FROM estoque WHERE vcto IS NOT NULL AND vcto != ''");
+    let criados = 0;
+    for (const c of cotas.rows) {
+      const titulo = 'Vencimento ' + c.grupo + '/' + c.cota;
+      // Verifica se ja existe
+      const existe = await pool.query(
+        "SELECT id FROM agenda WHERE titulo=$1 AND data=$2 AND tipo='VENCIMENTO'",
+        [titulo, c.vcto]
+      );
+      if (!existe.rows.length) {
+        await pool.query(
+          "INSERT INTO agenda (titulo,descricao,data,hora,tipo,status,grupo,cota,cliente) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+          [titulo, 'Parcela: R$ '+c.parcela+' | Credito: R$ '+c.credito+' | Investidor: '+c.investidor, c.vcto, '09:00', 'VENCIMENTO', 'PENDENTE', c.grupo, c.cota, c.investidor]
+        );
+        criados++;
+      }
+    }
+    res.json({ ok: true, criados });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Move cota estoque -> vendas contempladas
+app.post('/api/estoque/:id/vender', auth, async function(req, res) {
+  try {
+    const cota = await pool.query('SELECT * FROM estoque WHERE id=$1', [req.params.id]);
+    if (!cota.rows.length) return res.status(404).json({ error: 'Cota nao encontrada' });
+    const c = cota.rows[0];
+    const body = req.body;
+    // Insert into vendas
+    const v = await pool.query(
+      'INSERT INTO vendas (adm,grupo,cota,credito,vpago,lance,agil,entrada,parc_ant,parc_nova,pertence,cliente,intermediador,pago_cli,data,banco,vcto,status,vendedor,obs) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) RETURNING *',
+      [c.adm, c.grupo, c.cota, c.credito, body.vpago||0, body.lance||0, body.agil||0, body.entrada||0, body.parc_ant||0, body.parc_nova||0, c.investidor, body.cliente||'', body.intermediador||'', body.pago_cli||0, body.data||new Date().toISOString().split('T')[0], body.banco||'', c.vcto||'', 'PENDENTE', body.vendedor||'', body.obs||'']
+    );
+    // Remove from estoque
+    await pool.query('DELETE FROM estoque WHERE id=$1', [req.params.id]);
+    res.json({ ok: true, venda: v.rows[0] });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
